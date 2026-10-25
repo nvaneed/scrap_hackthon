@@ -1,0 +1,803 @@
+/*
+  Wall clock: 28BYJ-48 + ULN2003 on ESP32  +  world-clock web page (single file)
+  - Motor shaft turns the minute hand; the clock's own gears move the hour hand.
+    1 motor turn = 1 hour, so going from 11:30 to 10:30 means a full round.
+  - Hand position is saved in flash, so it is remembered after power off/reset.
+  - Joins Wi-Fi and serves a page at http://wallclock.local (or the IP shown in
+    Serial Monitor). Tap a city -> hands go to that city's time, then run normally.
+
+  Serial Monitor (115200 baud):
+    10:30   -> both hands move quickly to 10:30, then the clock runs normally
+    c11:30  -> "the hands are showing 11:30 right now" (no movement, saved)
+    ?       -> print the time the clock is showing and the web address
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <Preferences.h>
+
+// ---------- Wi-Fi ----------
+const char *WIFI_SSID = "Nothingo";
+const char *WIFI_PASS = "123123123";
+const char *HOSTNAME  = "wallclock";          // -> http://wallclock.local
+
+// ---------- Wiring (ULN2003 IN1..IN4) ----------
+const uint8_t IN1 = 18;
+const uint8_t IN2 = 19;
+const uint8_t IN3 = 21;
+const uint8_t IN4 = 22;
+
+// ---------- Settings ----------
+const int START_HOUR = 11;   // where the hands are on the very first start
+const int START_MIN  = 30;
+
+// Half-steps per shaft turn x1000. Standard 28BYJ-48 (63.68:1 gearbox) = 4075.773
+const int64_t HALF_STEPS_PER_REV_X1000 = 4075773;
+
+const bool SHORTEST_WAY   = true;   // may run backwards (max 6 hours of travel)
+const bool FLIP_DIRECTION = false;  // set true if the hands run anticlockwise
+
+const unsigned int START_US = 3000; // step interval at the start of a fast move
+const unsigned int FAST_US  = 1200; // top speed (increase if the motor skips)
+const unsigned int RAMP_US  = 15;   // how quickly it speeds up
+
+const unsigned long SAVE_EVERY_MS = 10000;  // save hand position every 10 s
+
+// ---------- Internals ----------
+const int64_t MS_PER_HOUR = 3600000LL;
+const int64_t MS_PER_12H  = 12 * MS_PER_HOUR;
+const int64_t MS_X1000    = MS_PER_HOUR * 1000;
+
+const uint8_t SEQ[8][4] = {          // half-step sequence
+  {1,0,0,0}, {1,1,0,0}, {0,1,0,0}, {0,1,1,0},
+  {0,0,1,0}, {0,0,1,1}, {0,0,0,1}, {1,0,0,1}
+};
+
+Preferences prefs;
+WebServer server(80);
+
+int64_t dialMs = 0;    // time the hands should show (keeps counting)
+long motorPos  = 0;    // motor position in half-steps (0 = 12:00)
+long savedPos  = 0;
+char label[32] = "";   // city the clock is set to ("" = custom time)
+
+unsigned long lastMillis = 0;
+unsigned long lastStepUs = 0;
+unsigned long lastSaveMs = 0;
+unsigned long lastPubMs  = 0;
+unsigned int  stepUs     = START_US;
+int  lastDir = 1;
+bool coilsOn = false;
+bool moving  = false;
+
+char buf[16];
+uint8_t bufLen = 0;
+unsigned long lastCharMs = 0;
+
+// ---------- Shared between web task (core 0) and loop() (core 1) ----------
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+bool    webCmd = false;          // web -> loop
+bool    webCal = false;
+int64_t webTarget = 0;
+char    webLabel[32] = "";
+long    pubShown  = 0;           // loop -> web: where the hands are (ms within 12 h)
+long    pubRemain = 0;           //              how far they still have to travel (ms)
+char    pubLabel[32] = "";
+
+// ---------- Time <-> steps ----------
+int64_t floorDiv(int64_t a, int64_t b) {
+  int64_t q = a / b;
+  if ((a % b != 0) && (a < 0)) q--;
+  return q;
+}
+
+int64_t ceilDiv(int64_t a, int64_t b) {
+  int64_t q = a / b;
+  if ((a % b != 0) && (a > 0)) q++;
+  return q;
+}
+
+long msToSteps(int64_t ms) {
+  return (long)floorDiv(ms * HALF_STEPS_PER_REV_X1000, MS_X1000);
+}
+
+int64_t stepsToMs(long steps) {
+  return ceilDiv((int64_t)steps * MS_X1000, HALF_STEPS_PER_REV_X1000);
+}
+
+int64_t mod12(int64_t t) {
+  return ((t % MS_PER_12H) + MS_PER_12H) % MS_PER_12H;
+}
+
+int64_t clockMs(int h, int m, int s) {
+  return (((int64_t)(h % 12) * 60 + m) * 60 + s) * 1000LL;
+}
+
+// ---------- Motor ----------
+void writeCoils(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
+  digitalWrite(IN1, a);
+  digitalWrite(IN2, b);
+  digitalWrite(IN3, c);
+  digitalWrite(IN4, d);
+}
+
+void stepMotor(int dir) {
+  motorPos += dir;
+  long p = FLIP_DIRECTION ? -motorPos : motorPos;
+  const uint8_t *s = SEQ[((p % 8) + 8) % 8];
+  writeCoils(s[0], s[1], s[2], s[3]);
+  coilsOn = true;
+}
+
+void releaseCoils() {               // keeps the motor cool between ticks
+  writeCoils(0, 0, 0, 0);
+  coilsOn = false;
+}
+
+// ---------- Memory ----------
+void savePosition() {
+  if (motorPos != savedPos) {
+    prefs.putLong("pos", motorPos);
+    savedPos = motorPos;
+  }
+}
+
+void setLabel(const char *name) {
+  if (strcmp(label, name) == 0) return;
+  strlcpy(label, name, sizeof(label));
+  prefs.putString("label", label);
+}
+
+// ---------- Display ----------
+void printDial(const char *text) {
+  int64_t t = mod12(dialMs);
+  int totalMin = (int)(t / 60000);
+  int h = totalMin / 60;
+  if (h == 0) h = 12;
+  Serial.printf("%s%d:%02d\n", text, h, totalMin % 60);
+}
+
+void printAddress() {
+  if (WiFi.status() == WL_CONNECTED)
+    Serial.printf("Web page: http://%s   or   http://%s.local\n",
+                  WiFi.localIP().toString().c_str(), HOSTNAME);
+  else
+    Serial.printf("Wi-Fi: not connected yet (looking for \"%s\")\n", WIFI_SSID);
+}
+
+// ---------- Moves ----------
+void goTo(int64_t target, const char *name) {
+  int64_t move = target - mod12(dialMs);   // 0 to <12 h forward
+  if (move < 0) move += MS_PER_12H;
+  if (SHORTEST_WAY && move > MS_PER_12H / 2) move -= MS_PER_12H;
+
+  dialMs += move;
+  setLabel(name);
+
+  long mins = (long)((move < 0 ? -move : move) / 60000);
+  printDial("Going to ");
+  Serial.printf("  (%s %ld h %ld min)%s%s\n", move >= 0 ? "forward" : "backward",
+                mins / 60, mins % 60, *name ? "  for " : "", name);
+}
+
+void calibrateTo(int64_t target) {    // hands are physically here: just remember it
+  dialMs   = target;
+  motorPos = msToSteps(target);
+  moving   = false;
+  savePosition();
+  setLabel("");
+  printDial("OK, hands set at ");
+}
+
+// ---------- Serial commands ----------
+void handleCommand(char *s) {
+  while (*s == ' ') s++;
+
+  if (*s == '?') { printDial("Clock shows "); printAddress(); return; }
+
+  bool calibrate = false;
+  if (*s == 'c' || *s == 'C') { calibrate = true; s++; }
+
+  int h, m;
+  if (sscanf(s, "%d:%d", &h, &m) != 2 || h < 0 || h > 23 || m < 0 || m > 59) {
+    Serial.println("Use H:MM like 10:30  (c11:30 = hands are at 11:30, ? = show time)");
+    return;
+  }
+
+  if (calibrate) calibrateTo(clockMs(h, m, 0));
+  else           goTo(clockMs(h, m, 0), "");
+}
+
+void readSerial() {
+  while (Serial.available()) {
+    char ch = Serial.read();
+    lastCharMs = millis();
+    if (ch == '\n' || ch == '\r') {
+      if (bufLen) { buf[bufLen] = 0; handleCommand(buf); bufLen = 0; }
+    } else if (bufLen < sizeof(buf) - 1) {
+      buf[bufLen++] = ch;
+    }
+  }
+  // Also works when the Serial Monitor is set to "No line ending"
+  if (bufLen && millis() - lastCharMs > 50) {
+    buf[bufLen] = 0; handleCommand(buf); bufLen = 0;
+  }
+}
+
+// ---------- Web page ----------
+// The page below uses no double quotes on purpose, so the Arduino IDE
+// prototype scanner does not mistake the JavaScript for C++ functions.
+const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+<meta charset='utf-8'>
+<meta name='viewport' content='width=device-width,initial-scale=1,viewport-fit=cover'>
+<meta name='theme-color' content='#0a0f1f'>
+<title>Wall Clock</title>
+<link rel='icon' href='data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22%3E%3Ctext y=%22.9em%22 font-size=%2290%22%3E%F0%9F%95%B0%3C/text%3E%3C/svg%3E'>
+<style>
+:root{--bg:#0a0f1f;--card:rgba(255,255,255,.055);--card2:rgba(255,255,255,.09);--line:rgba(255,255,255,.09);--txt:#eef2ff;--mut:#97a1bd;--acc:#7aa2ff;--acc2:#5eead4;color-scheme:dark}
+*{box-sizing:border-box;margin:0;padding:0}
+[hidden]{display:none!important}
+body{font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;color:var(--txt);background:radial-gradient(1000px 600px at 0% -10%,#1e2b63 0,transparent 60%),radial-gradient(800px 500px at 100% 0%,#0d4a4a 0,transparent 55%),var(--bg);background-attachment:fixed;min-height:100vh;padding:20px 16px 100px;-webkit-tap-highlight-color:transparent}
+.wrap{max-width:1080px;margin:0 auto}
+header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:18px}
+h1{font-size:22px;font-weight:750;letter-spacing:-.3px}
+.sub{color:var(--mut);font-size:13px;margin-top:2px}
+.pill{font-size:12px;padding:7px 12px;border-radius:99px;background:var(--card);border:1px solid var(--line);color:var(--mut);white-space:nowrap;display:flex;align-items:center;gap:7px}
+.pill::before{content:'';width:7px;height:7px;border-radius:50%;background:#64748b}
+.pill.on::before{background:#34d399;box-shadow:0 0 10px #34d399}
+.pill.off::before{background:#f87171;box-shadow:0 0 10px #f87171}
+.hero{display:flex;align-items:center;gap:28px;flex-wrap:wrap;padding:24px;border-radius:26px;background:linear-gradient(135deg,rgba(122,162,255,.16),rgba(94,234,212,.07));border:1px solid var(--line);box-shadow:0 20px 60px rgba(0,0,0,.35)}
+.dial{width:200px;height:200px;flex:none;filter:drop-shadow(0 14px 30px rgba(0,0,0,.55))}
+.rim{fill:#20294a;stroke:rgba(255,255,255,.15);stroke-width:1.5}
+.face{fill:#f6f5f0}
+.t{stroke:#a3a9b6;stroke-width:1}
+.T{stroke:#232a3d;stroke-width:2.6;stroke-linecap:round}
+.num{font:600 13px system-ui,sans-serif;fill:#232a3d;text-anchor:middle;dominant-baseline:central}
+.hand{stroke-linecap:round;transition:stroke .3s}
+.hour{stroke:#1a2033;stroke-width:6.5}
+.min{stroke:#1a2033;stroke-width:4}
+.moving .min{stroke:#3b6cff}
+.pin{fill:#1a2033}
+.pin2{fill:#e8505b}
+.info{flex:1;min-width:230px}
+.where{display:flex;align-items:center;gap:12px}
+.hname{font-size:19px;font-weight:700}
+.hsub{color:var(--mut);font-size:13px;margin-top:2px}
+.digital{font-size:64px;font-weight:800;letter-spacing:-2px;line-height:1;margin-top:14px;font-variant-numeric:tabular-nums}
+.state{color:var(--mut);font-size:14px;margin-top:10px;min-height:1.2em}
+.moving .state{color:var(--acc2)}
+.bar{height:6px;border-radius:9px;background:rgba(255,255,255,.08);overflow:hidden;margin-top:12px;opacity:0;transition:opacity .3s}
+.moving .bar{opacity:1}
+.bar i{display:block;height:100%;width:0;border-radius:9px;background:linear-gradient(90deg,var(--acc),var(--acc2));transition:width .35s}
+.tools{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:24px 0 14px}
+.search{flex:1 1 240px;min-width:0;padding:12px 16px;border-radius:14px;border:1px solid var(--line);background:var(--card);color:var(--txt);font:inherit;outline:none}
+.search:focus{border-color:var(--acc)}
+.chips{display:flex;gap:8px;overflow-x:auto;scrollbar-width:none;max-width:100%}
+.chip{flex:none;padding:9px 14px;border-radius:99px;border:1px solid var(--line);background:var(--card);color:var(--mut);font:inherit;font-size:13px;cursor:pointer}
+.chip.sel{background:var(--txt);color:#0a0f1f;border-color:transparent;font-weight:650}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(168px,1fr));gap:12px}
+.card{width:100%;font:inherit;color:inherit;text-align:left;cursor:pointer;padding:14px 14px 12px;border-radius:18px;background:var(--card);border:1px solid var(--line);transition:transform .15s,border-color .2s,background .2s,box-shadow .2s}
+.card:hover{transform:translateY(-2px);border-color:rgba(255,255,255,.22);background:var(--card2)}
+.card:active{transform:scale(.97)}
+.card:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+.card.night{background:rgba(6,10,26,.5)}
+.card.home{background:linear-gradient(135deg,rgba(94,234,212,.16),rgba(122,162,255,.08))}
+.card.active{border-color:var(--acc);box-shadow:0 0 0 1px var(--acc),0 10px 30px rgba(122,162,255,.25)}
+.card.sending{opacity:.55;pointer-events:none}
+.top{display:flex;align-items:center;gap:10px}
+.fs{display:flex;flex:none}
+.flag{width:40px;height:28px;border-radius:6px;object-fit:cover;flex:none;box-shadow:0 2px 8px rgba(0,0,0,.45);display:inline-flex;align-items:center;justify-content:center;font-size:22px;line-height:1}
+.flag.big{width:52px;height:36px;font-size:30px;border-radius:8px}
+.flag.emo{box-shadow:none}
+.who{flex:1;min-width:0}
+.city{font-weight:650;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.country{color:var(--mut);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px}
+.dn{font-size:15px}
+.time{margin-top:12px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.hm{font-size:30px;font-weight:750;letter-spacing:-.5px}
+.ap{font-size:12px;font-weight:650;color:var(--mut);margin-left:5px}
+.meta{display:flex;justify-content:space-between;gap:8px;color:var(--mut);font-size:12px;margin-top:3px}
+.empty{color:var(--mut);text-align:center;padding:30px}
+.panel{margin-top:24px;padding:6px 18px;border-radius:20px;background:var(--card);border:1px solid var(--line)}
+.row{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;padding:14px 0}
+.row+.row{border-top:1px solid var(--line)}
+.lbl b{display:block;font-size:15px}
+.lbl span{color:var(--mut);font-size:12.5px}
+.ctl{display:flex;gap:8px}
+.ctl input{padding:10px 12px;border-radius:12px;border:1px solid var(--line);background:rgba(0,0,0,.25);color:var(--txt);font:inherit}
+.btn{padding:10px 18px;border-radius:12px;border:0;background:linear-gradient(135deg,var(--acc),#9b8cff);color:#0a0f1f;font:inherit;font-weight:700;cursor:pointer}
+.btn.ghost{background:transparent;color:var(--txt);border:1px solid rgba(255,255,255,.25)}
+.btn:active{transform:scale(.96)}
+.toast{position:fixed;left:50%;bottom:26px;transform:translate(-50%,20px);opacity:0;pointer-events:none;padding:12px 18px;border-radius:14px;background:#eef2ff;color:#0a0f1f;font-weight:650;font-size:14px;box-shadow:0 12px 40px rgba(0,0,0,.45);transition:.25s;max-width:90vw;text-align:center}
+.toast.show{opacity:1;transform:translate(-50%,0)}
+.toast.bad{background:#fecaca;color:#450a0a}
+@media(max-width:520px){.hero{padding:18px;gap:18px;justify-content:center}.dial{width:170px;height:170px}.digital{font-size:52px}.grid{grid-template-columns:repeat(2,1fr);gap:10px}.hm{font-size:26px}}
+</style>
+</head>
+<body>
+<div class='wrap'>
+  <header>
+    <div>
+      <h1>World Clock</h1>
+      <p class='sub'>Tap a city and the wall clock goes to its time</p>
+    </div>
+    <span id='conn' class='pill'>Connecting…</span>
+  </header>
+
+  <section id='hero' class='hero'>
+    <svg class='dial' viewBox='0 0 200 200' aria-hidden='true'>
+      <circle cx='100' cy='100' r='97' class='rim'/>
+      <circle cx='100' cy='100' r='90' class='face'/>
+      <g id='ticks'></g>
+      <line id='hh' class='hand hour' x1='100' y1='112' x2='100' y2='56'/>
+      <line id='mh' class='hand min' x1='100' y1='116' x2='100' y2='29'/>
+      <circle cx='100' cy='100' r='6' class='pin'/>
+      <circle cx='100' cy='100' r='2.2' class='pin2'/>
+    </svg>
+    <div class='info'>
+      <div class='where'>
+        <span id='hflag' class='fs'></span>
+        <div><div id='hname' class='hname'>—</div><div id='hsub' class='hsub'>Waiting for the clock…</div></div>
+      </div>
+      <div id='digital' class='digital'>--:--</div>
+      <div id='state' class='state'></div>
+      <div class='bar'><i id='bar'></i></div>
+    </div>
+  </section>
+
+  <div class='tools'>
+    <input id='q' class='search' type='search' placeholder='Search city or country' autocomplete='off'>
+    <div id='chips' class='chips'></div>
+  </div>
+
+  <div id='grid' class='grid'></div>
+  <p id='empty' class='empty' hidden>No city matches.</p>
+
+  <section class='panel'>
+    <div class='row'>
+      <div class='lbl'><b>Go to any time</b><span>Hands move there, then keep running</span></div>
+      <div class='ctl'><input id='tGo' type='time'><button id='bGo' class='btn' type='button'>Go</button></div>
+    </div>
+    <div class='row'>
+      <div class='lbl'><b>Calibrate</b><span>Enter what the hands show right now (nothing moves)</span></div>
+      <div class='ctl'><input id='tCal' type='time'><button id='bCal' class='btn ghost' type='button'>Save</button></div>
+    </div>
+  </section>
+</div>
+<div id='toast' class='toast'></div>
+
+<script>
+const CITIES=[
+['New Delhi','India','in','Asia/Kolkata','Asia'],
+['Dubai','United Arab Emirates','ae','Asia/Dubai','Asia'],
+['Doha','Qatar','qa','Asia/Qatar','Asia'],
+['Riyadh','Saudi Arabia','sa','Asia/Riyadh','Asia'],
+['Karachi','Pakistan','pk','Asia/Karachi','Asia'],
+['Kathmandu','Nepal','np','Asia/Kathmandu','Asia'],
+['Dhaka','Bangladesh','bd','Asia/Dhaka','Asia'],
+['Bangkok','Thailand','th','Asia/Bangkok','Asia'],
+['Jakarta','Indonesia','id','Asia/Jakarta','Asia'],
+['Singapore','Singapore','sg','Asia/Singapore','Asia'],
+['Hong Kong','Hong Kong','hk','Asia/Hong_Kong','Asia'],
+['Beijing','China','cn','Asia/Shanghai','Asia'],
+['Seoul','South Korea','kr','Asia/Seoul','Asia'],
+['Tokyo','Japan','jp','Asia/Tokyo','Asia'],
+['London','United Kingdom','gb','Europe/London','Europe'],
+['Paris','France','fr','Europe/Paris','Europe'],
+['Berlin','Germany','de','Europe/Berlin','Europe'],
+['Rome','Italy','it','Europe/Rome','Europe'],
+['Madrid','Spain','es','Europe/Madrid','Europe'],
+['Amsterdam','Netherlands','nl','Europe/Amsterdam','Europe'],
+['Zurich','Switzerland','ch','Europe/Zurich','Europe'],
+['Istanbul','Türkiye','tr','Europe/Istanbul','Europe'],
+['Moscow','Russia','ru','Europe/Moscow','Europe'],
+['New York','United States','us','America/New_York','Americas'],
+['Chicago','United States','us','America/Chicago','Americas'],
+['Los Angeles','United States','us','America/Los_Angeles','Americas'],
+['Toronto','Canada','ca','America/Toronto','Americas'],
+['Mexico City','Mexico','mx','America/Mexico_City','Americas'],
+['Sao Paulo','Brazil','br','America/Sao_Paulo','Americas'],
+['Buenos Aires','Argentina','ar','America/Argentina/Buenos_Aires','Americas'],
+['Cairo','Egypt','eg','Africa/Cairo','Africa'],
+['Lagos','Nigeria','ng','Africa/Lagos','Africa'],
+['Nairobi','Kenya','ke','Africa/Nairobi','Africa'],
+['Johannesburg','South Africa','za','Africa/Johannesburg','Africa'],
+['Sydney','Australia','au','Australia/Sydney','Oceania'],
+['Auckland','New Zealand','nz','Pacific/Auckland','Oceania'],
+['Honolulu','United States','us','Pacific/Honolulu','Oceania']
+];
+const REGIONS=['All','Asia','Europe','Americas','Africa','Oceania'];
+
+let region='All',peak=0,timer=null,seq=0,lastLabel=null,calSet=false,cum=null,disp=0,tt=null;
+const cards=[];
+
+/* ---- helpers ---- */
+const $=id=>document.getElementById(id);
+const pad=n=>String(n).padStart(2,'0');
+const fmt12=(h,m)=>(h%12||12)+':'+pad(m)+(h<12?' AM':' PM');
+const emojiFlag=cc=>cc.toUpperCase().replace(/./g,c=>String.fromCodePoint(127397+c.charCodeAt(0)));
+const mkFmt=tz=>new Intl.DateTimeFormat('en-US',{timeZone:tz,hourCycle:'h23',year:'numeric',month:'numeric',day:'numeric',hour:'numeric',minute:'numeric',second:'numeric'});
+const parts=(f,d)=>{const o={};for(const p of f.formatToParts(d))o[p.type]=p.value;return{y:+o.year,mo:+o.month,d:+o.day,h:(+o.hour)%24,mi:+o.minute,s:+o.second};};
+const flagEl=(c,big)=>{
+  const cls='flag'+(big?' big':'');
+  const emo=t=>{const s=document.createElement('span');s.className=cls+' emo';s.textContent=t;return s;};
+  if(!c||!c.cc)return emo(c?'🏠':'🕰️');
+  const i=new Image();i.className=cls;i.alt='';i.src='https://flagcdn.com/'+c.cc+'.svg';
+  i.onerror=()=>i.replaceWith(emo(emojiFlag(c.cc)));
+  return i;
+};
+const offText=m=>{
+  if(!m)return 'Same as you';
+  const a=Math.abs(m),h=Math.floor(a/60),r=a%60;
+  return (m>0?'+':'−')+(h?h+'h':'')+(r?(h?' ':'')+r+'m':'');
+};
+const dur=ms=>{const t=Math.ceil(ms/60000),h=Math.floor(t/60),m=t%60;return h?h+' h '+m+' min':m+' min';};
+const toast=(t,bad)=>{const e=$('toast');e.textContent=t;e.className='toast show'+(bad?' bad':'');clearTimeout(tt);tt=setTimeout(()=>e.className='toast',2600);};
+const conn=ok=>{const e=$('conn');e.textContent=ok?'Connected':'Offline';e.className='pill '+(ok?'on':'off');};
+
+/* ---- live city times ---- */
+const tick=()=>{
+  const d=new Date(),base=Math.floor(d.getTime()/1000)*1000,my=-d.getTimezoneOffset();
+  const today=Date.UTC(d.getFullYear(),d.getMonth(),d.getDate());
+  for(const c of cards){
+    const p=parts(c.f,d);
+    const off=Math.round((Date.UTC(p.y,p.mo-1,p.d,p.h,p.mi,p.s)-base)/60000)-my;
+    const day=p.h>=6&&p.h<18;
+    c.hm.textContent=(p.h%12||12)+':'+pad(p.mi);
+    c.ap.textContent=p.h<12?'AM':'PM';
+    c.dn.textContent=day?'☀️':'🌙';
+    c.el.classList.toggle('night',!day);
+    c.off.textContent=c.home?'Your zone':offText(off);
+    const dd=Date.UTC(p.y,p.mo-1,p.d)-today;
+    c.day.textContent=dd>0?'Tomorrow':dd<0?'Yesterday':'Today';
+  }
+};
+const filter=()=>{
+  const q=$('q').value.trim().toLowerCase();let n=0;
+  for(const c of cards){
+    const inRegion=c.home?region==='All':(region==='All'||c.region===region);
+    const ok=inRegion&&(!q||(c.name+' '+c.country).toLowerCase().includes(q));
+    c.el.hidden=!ok;if(ok)n++;
+  }
+  $('empty').hidden=n>0;
+};
+
+/* ---- talking to the clock ---- */
+const send=async(url,msg,el)=>{
+  if(el)el.classList.add('sending');
+  try{const r=await fetch(url,{cache:'no-store'});if(!r.ok)throw 0;toast(msg);peak=0;poll();}
+  catch(e){toast('Couldn’t reach the clock',1);}
+  if(el)el.classList.remove('sending');
+};
+const goCity=c=>{
+  const p=parts(c.f,new Date());
+  send('/go?h='+p.h+'&m='+p.mi+'&s='+p.s+'&name='+encodeURIComponent(c.name),'Going to '+c.name+' · '+fmt12(p.h,p.mi),c.el);
+};
+const setHands=ms=>{
+  const hrs=ms/3600000;
+  if(cum===null){cum=disp=hrs;return;}
+  let d=hrs-(((cum%12)+12)%12);
+  if(d>6)d-=12;if(d<-6)d+=12;
+  cum+=d;
+};
+const render=(s,moving)=>{
+  setHands(s.shown);
+  const h=Math.floor(s.shown/3600000)||12,m=Math.floor(s.shown/60000)%60;
+  $('digital').textContent=h+':'+pad(m);
+  if(!calSet){$('tCal').value=pad(h)+':'+pad(m);calSet=true;}
+  $('hero').classList.toggle('moving',moving);
+  if(moving){
+    const a=Math.abs(s.remain);peak=Math.max(peak,a);
+    $('state').textContent=(s.remain>0?'Moving forward':'Moving backward')+' · '+dur(a)+' to go';
+    $('bar').style.width=(peak?100*(1-a/peak):0)+'%';
+  }else{
+    peak=0;$('state').textContent='Running normally';$('bar').style.width='0%';
+  }
+  if(s.label!==lastLabel){
+    lastLabel=s.label;
+    const c=cards.find(x=>x.name===s.label);
+    const fs=$('hflag');fs.textContent='';fs.appendChild(flagEl(c||null,true));
+    $('hname').textContent=c?c.name:'Custom time';
+    $('hsub').textContent=c?(c.home?'Your time zone':c.country):'Set by hand';
+    for(const x of cards)x.el.classList.toggle('active',x===c);
+  }
+};
+const poll=async()=>{
+  const my=++seq;clearTimeout(timer);let moving=false;
+  try{
+    const r=await fetch('/status',{cache:'no-store'});const s=await r.json();
+    if(my!==seq)return;
+    conn(true);moving=Math.abs(s.remain)>2000;render(s,moving);
+  }catch(e){if(my!==seq)return;conn(false);}
+  timer=setTimeout(poll,moving?300:1500);
+};
+
+/* ---- build the page ---- */
+(()=>{
+  let s='';
+  for(let i=0;i<60;i++){
+    const a=i*Math.PI/30,b=i%5===0,r2=b?73:80,sn=Math.sin(a),cs=Math.cos(a);
+    s+=`<line class='${b?'T':'t'}' x1='${(100+85*sn).toFixed(2)}' y1='${(100-85*cs).toFixed(2)}' x2='${(100+r2*sn).toFixed(2)}' y2='${(100-r2*cs).toFixed(2)}'/>`;
+  }
+  [[12,0],[3,90],[6,180],[9,270]].forEach(([n,g])=>{
+    const a=g*Math.PI/180;
+    s+=`<text class='num' x='${(100+61*Math.sin(a)).toFixed(1)}' y='${(100-61*Math.cos(a)).toFixed(1)}'>${n}</text>`;
+  });
+  $('ticks').innerHTML=s;
+})();
+
+const myTz=Intl.DateTimeFormat().resolvedOptions().timeZone||'UTC';
+const list=[{name:'Your time',country:myTz.replace(/_/g,' '),cc:'',tz:myTz,region:'',home:true}]
+  .concat(CITIES.map(a=>({name:a[0],country:a[1],cc:a[2],tz:a[3],region:a[4]})));
+for(const c of list){
+  try{c.f=mkFmt(c.tz);}catch(e){continue;}
+  const b=document.createElement('button');
+  b.type='button';
+  b.className='card'+(c.home?' home':'');
+  b.innerHTML=`<div class='top'><span class='fs'></span><div class='who'><div class='city'></div><div class='country'></div></div><span class='dn'></span></div><div class='time'><span class='hm'>--:--</span><span class='ap'></span></div><div class='meta'><span class='off'></span><span class='day'></span></div>`;
+  b.querySelector('.fs').appendChild(flagEl(c,false));
+  b.querySelector('.city').textContent=c.name;
+  b.querySelector('.country').textContent=c.country;
+  for(const k of ['hm','ap','off','day','dn'])c[k]=b.querySelector('.'+k);
+  b.onclick=()=>goCity(c);
+  c.el=b;$('grid').appendChild(b);cards.push(c);
+}
+
+const chips=$('chips');
+REGIONS.forEach(r=>{
+  const b=document.createElement('button');
+  b.type='button';b.className='chip'+(r==='All'?' sel':'');b.textContent=r;
+  b.onclick=()=>{region=r;[...chips.children].forEach(x=>x.classList.toggle('sel',x===b));filter();};
+  chips.appendChild(b);
+});
+$('q').oninput=filter;
+
+$('bGo').onclick=()=>{
+  const v=$('tGo').value;if(!v)return toast('Pick a time first',1);
+  const [h,m]=v.split(':').map(Number);
+  send('/go?h='+h+'&m='+m+'&s=0','Going to '+fmt12(h,m));
+};
+$('bCal').onclick=()=>{
+  const v=$('tCal').value;if(!v)return toast('Enter what the hands show',1);
+  const [h,m]=v.split(':').map(Number);
+  send('/cal?h='+h+'&m='+m,'Saved: hands are at '+(h%12||12)+':'+pad(m));
+};
+
+const HH=$('hh'),MH=$('mh');
+const anim=()=>{
+  if(cum!==null){
+    disp+=(cum-disp)*0.18;if(Math.abs(cum-disp)<1e-4)disp=cum;
+    MH.setAttribute('transform','rotate('+(disp*360).toFixed(2)+' 100 100)');
+    HH.setAttribute('transform','rotate('+(disp*30).toFixed(2)+' 100 100)');
+  }
+  requestAnimationFrame(anim);
+};
+
+filter();tick();setInterval(tick,1000);poll();anim();
+</script>
+</body>
+</html>
+)rawliteral";
+
+// ---------- Web (runs in its own task on core 0) ----------
+bool readTimeArgs(int64_t &out) {
+  if (!server.hasArg("h") || !server.hasArg("m")) return false;
+  int h = server.arg("h").toInt();
+  int m = server.arg("m").toInt();
+  int s = server.hasArg("s") ? server.arg("s").toInt() : 0;
+  if (h < 0 || h > 23 || m < 0 || m > 59 || s < 0 || s > 59) return false;
+  out = clockMs(h, m, s);
+  return true;
+}
+
+void queueWebCommand(bool calibrate) {
+  int64_t t;
+  if (!readTimeArgs(t)) {
+    server.send(400, "application/json", "{\"ok\":false}");
+    return;
+  }
+
+  char name[32];
+  size_t n = 0;
+  String raw = server.arg("name");
+  for (size_t i = 0; i < raw.length() && n < sizeof(name) - 1; i++) {
+    char ch = raw[i];
+    if (ch >= 32 && ch <= 126 && ch != '"' && ch != '\\' && ch != '<' && ch != '>')
+      name[n++] = ch;
+  }
+  name[n] = 0;
+
+  portENTER_CRITICAL(&mux);
+  webTarget = t;
+  webCal    = calibrate;
+  memcpy(webLabel, name, n + 1);
+  webCmd    = true;
+  portEXIT_CRITICAL(&mux);
+
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleStatus() {
+  long shown, remain;
+  char name[32];
+  portENTER_CRITICAL(&mux);
+  shown  = pubShown;
+  remain = pubRemain;
+  memcpy(name, pubLabel, sizeof(name));
+  portEXIT_CRITICAL(&mux);
+
+  char json[128];
+  snprintf(json, sizeof(json), "{\"shown\":%ld,\"remain\":%ld,\"label\":\"%s\"}",
+           shown, remain, name);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", json);
+}
+
+void webTask(void *) {
+  server.on("/",       []() { server.send_P(200, "text/html; charset=utf-8", INDEX_HTML); });
+  server.on("/go",     []() { queueWebCommand(false); });
+  server.on("/cal",    []() { queueWebCommand(true); });
+  server.on("/status", handleStatus);
+  server.onNotFound([]() { server.send(404, "text/plain", "Not found"); });
+  server.begin();
+
+  for (;;) {
+    server.handleClient();
+    vTaskDelay(2);
+  }
+}
+
+// ---------- loop() side of the sharing ----------
+void takeWebCommand() {
+  bool have, cal = false;
+  int64_t t = 0;
+  char name[32];
+
+  portENTER_CRITICAL(&mux);
+  have = webCmd;
+  if (have) {
+    cal = webCal;
+    t = webTarget;
+    memcpy(name, webLabel, sizeof(name));
+    webCmd = false;
+  }
+  portEXIT_CRITICAL(&mux);
+
+  if (!have) return;
+  if (cal) calibrateTo(t);
+  else     goTo(t, name);
+}
+
+void publish() {
+  int64_t hands = stepsToMs(motorPos);
+  long shown  = (long)mod12(hands);
+  long remain = (long)(dialMs - hands);
+
+  portENTER_CRITICAL(&mux);
+  pubShown  = shown;
+  pubRemain = remain;
+  memcpy(pubLabel, label, sizeof(pubLabel));
+  portEXIT_CRITICAL(&mux);
+}
+
+void checkWiFi(unsigned long nowMs) {
+  static bool online = false, mdnsOn = false;
+  static unsigned long lastCheck = 0, offlineSince = 0;
+  if (nowMs - lastCheck < 1000) return;
+  lastCheck = nowMs;
+
+  bool up = (WiFi.status() == WL_CONNECTED);
+  if (up && !online) {
+    if (!mdnsOn && MDNS.begin(HOSTNAME)) {
+      MDNS.addService("http", "tcp", 80);
+      mdnsOn = true;
+    }
+    printAddress();
+  }
+  if (!up) {
+    if (online) {
+      Serial.println("Wi-Fi lost, retrying...");
+      offlineSince = nowMs;
+    } else if (nowMs - offlineSince > 30000) {
+      WiFi.reconnect();
+      offlineSince = nowMs;
+    }
+  }
+  online = up;
+}
+
+// ---------- Main ----------
+void setup() {
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  releaseCoils();
+
+  Serial.begin(115200);
+  delay(500);
+
+  prefs.begin("clock", false);
+  if (prefs.isKey("pos")) {
+    motorPos = prefs.getLong("pos", 0);
+    dialMs = stepsToMs(motorPos);
+    printDial("Remembered: hands are at ");
+  } else {
+    motorPos = msToSteps(clockMs(START_HOUR, START_MIN, 0));
+    prefs.putLong("pos", motorPos);
+    dialMs = stepsToMs(motorPos);
+    printDial("First start: hands assumed at ");
+  }
+  if (prefs.isKey("label")) prefs.getString("label", label, sizeof(label));
+  savedPos = motorPos;
+  publish();
+
+  // Wi-Fi connects in the background; the clock keeps running meanwhile
+  WiFi.persistent(false);
+  WiFi.setHostname(HOSTNAME);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.printf("Connecting to Wi-Fi \"%s\"...\n", WIFI_SSID);
+
+  // Web server on core 0, so loading the page never stalls the motor (loop is on core 1)
+  xTaskCreatePinnedToCore(webTask, "web", 8192, nullptr, 1, nullptr, 0);
+
+  Serial.println("Send 10:30 to go there, c11:30 if hands are really at 11:30, ? for status.");
+  lastMillis = millis();
+  lastSaveMs = lastMillis;
+}
+
+void loop() {
+  readSerial();
+  takeWebCommand();
+
+  // Advance the clock by the real time that has passed
+  unsigned long nowMs = millis();
+  dialMs += (unsigned long)(nowMs - lastMillis);
+  lastMillis = nowMs;
+
+  long diff = msToSteps(dialMs) - motorPos;
+  unsigned long nowUs = micros();
+
+  if (diff != 0) {
+    unsigned long gap = nowUs - lastStepUs;
+    if (gap >= stepUs) {
+      int dir = (diff > 0) ? 1 : -1;
+      // New direction, or loop was held up (flash save etc.): start slowly again
+      if (dir != lastDir || gap > stepUs + 2000UL) { stepUs = START_US; lastDir = dir; }
+
+      stepMotor(dir);
+      lastStepUs = nowUs;
+
+      stepUs = (stepUs > FAST_US + RAMP_US) ? stepUs - RAMP_US : FAST_US;
+      if (diff > 1 || diff < -1) moving = true;
+    }
+  } else {
+    stepUs = START_US;
+    if (coilsOn && nowUs - lastStepUs > 20000UL) releaseCoils();
+    if (moving) {
+      moving = false;
+      savePosition();
+      printDial("Arrived. Running normally at ");
+    }
+  }
+
+  // Save position regularly so it survives a power cut
+  if (nowMs - lastSaveMs >= SAVE_EVERY_MS) {
+    lastSaveMs = nowMs;
+    savePosition();
+  }
+
+  // Share the hand position with the web page
+  if (nowMs - lastPubMs >= 100) {
+    lastPubMs = nowMs;
+    publish();
+  }
+
+  checkWiFi(nowMs);
+}
